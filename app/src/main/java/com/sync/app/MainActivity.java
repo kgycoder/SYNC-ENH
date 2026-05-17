@@ -431,10 +431,10 @@ public class MainActivity extends AppCompatActivity {
     // ════════════════════════════════════════════════════
     //  LYRICS — 진입점
     //
-    //  Phase -1: 원본 무변형 lrclib /api/get 직접 조회 (최우선)
-    //  Phase  0: 정제 제목 lrclib /api/get 직접 조회 (다중 콤보)
-    //  Phase  1: lrclib /api/search (다중 쿼리 변형)
-    //  Phase  2: NetEase 검색 (다중 쿼리 변형)
+    //  Phase 0 : 원본 무변형 + 정제 lrclib /api/get (duration 유무 무관)
+    //  Phase 1 : lrclib /api/search (다중 쿼리 변형, 최대 15개)
+    //  Phase 2 : NetEase 검색 (다중 쿼리)
+    //  Phase 3 : lrclib /api/search 추가 폴백 (더 넓은 변형)
     // ════════════════════════════════════════════════════
     private void doFetchLyrics(JSONObject msg) {
         String rawTitle  = msg.optString("title");
@@ -448,30 +448,30 @@ public class MainActivity extends AppCompatActivity {
         String stripped = stripBrackets(ct);
         String feat     = extractFeat(rawTitle);
         String firstSeg = extractFirstSegment(ct);
+        // 원본 괄호 제거 (cleanTitle 없이)
+        String rawStripped = stripBrackets(rawTitle);
 
         Log.d(TAG, "[Lyrics] raw='" + rawTitle + "' ct='" + ct
                 + "' ca='" + ca + "' feat='" + feat + "' dur=" + dur);
 
-        // ── 쿼리 변형 목록 ──
-        List<String> variants = buildQueryVariants(
-                rawTitle, rawArtist, ct, ca, stripped, feat, firstSeg);
+        // ── Phase 0: lrclib /api/get 직접 조회 (원본+정제, duration 유무 무관) ──
+        JSONArray lines = tryLrclibDirectAll(rawTitle, rawArtist, ct, ca, stripped,
+                                             rawStripped, firstSeg, feat, dur);
 
-        JSONArray lines = null;
-
-        // Phase -1: 원본 무변형 lrclib 직접 조회 (최우선)
-        lines = tryLrclibDirectRaw(rawTitle, rawArtist, dur);
-
-        // Phase 0: 정제 제목 lrclib 직접 조회
-        if (!hasEnoughLines(lines))
-            lines = tryLrclibDirect(ct, ca, stripped, rawTitle, rawArtist, dur);
-
-        // Phase 1: lrclib 검색 (다중 쿼리)
-        if (!hasEnoughLines(lines))
+        // ── Phase 1: lrclib /api/search ──
+        if (!hasEnoughLines(lines)) {
+            List<String> variants = buildQueryVariants(
+                    rawTitle, rawArtist, ct, ca, stripped, rawStripped, feat, firstSeg);
             lines = tryLrclibSearch(variants, ct, ca, dur);
 
-        // Phase 2: NetEase 검색
-        if (!hasEnoughLines(lines))
-            lines = tryNetEase(variants, ct, ca, dur);
+            // ── Phase 2: NetEase ──
+            if (!hasEnoughLines(lines))
+                lines = tryNetEase(variants, ct, ca, dur);
+
+            // ── Phase 3: lrclib 추가 폴백 (duration 무시, 제목만) ──
+            if (!hasEnoughLines(lines))
+                lines = tryLrclibFallback(ct, ca, stripped, rawStripped, firstSeg, rawTitle, rawArtist);
+        }
 
         try {
             JSONObject result = new JSONObject();
@@ -492,96 +492,57 @@ public class MainActivity extends AppCompatActivity {
         return arr != null && arr.length() >= 3;
     }
 
-    // ────────────────────────────────────────────────────
-    //  쿼리 변형 목록 구성
-    //  ① 원본(무변형) 최우선 → ② 정제 → ③ 파생 변형
-    // ────────────────────────────────────────────────────
-    private List<String> buildQueryVariants(
+    // ════════════════════════════════════════════════════
+    //  Phase 0: lrclib /api/get — 원본+정제 다중 콤보
+    //  duration 있으면 duration 포함, 없으면 duration 없이도 시도
+    // ════════════════════════════════════════════════════
+    private JSONArray tryLrclibDirectAll(
             String rawTitle, String rawArtist,
-            String ct, String ca,
-            String stripped, String feat, String firstSeg) {
+            String ct, String ca, String stripped, String rawStripped,
+            String firstSeg, String feat, double dur) {
 
-        LinkedHashSet<String> set = new LinkedHashSet<>();
+        // 콤보: {trackName, artistName} 순서대로 시도
+        // 원본 무변형 최우선
+        List<String[]> combos = new ArrayList<>();
 
-        // ① 원본 무변형 — 절대 첫 번째
-        if (!rawArtist.isEmpty()) set.add(rawTitle + " " + rawArtist);
-        set.add(rawTitle);
+        // ① 원본 무변형
+        combos.add(new String[]{rawTitle, rawArtist});
+        combos.add(new String[]{rawTitle, ca});
+        combos.add(new String[]{rawTitle, ""});
 
-        // ② 정제 제목 + 정제 아티스트
-        if (!ca.isEmpty()) set.add(ct + " " + ca);
-        set.add(ct);
-
-        // ③ 괄호 완전 제거
-        if (!stripped.equals(ct)) {
-            if (!ca.isEmpty()) set.add(stripped + " " + ca);
-            set.add(stripped);
-            if (!rawArtist.isEmpty()) set.add(stripped + " " + rawArtist);
+        // ② 원본 괄호 제거
+        if (!rawStripped.equals(rawTitle)) {
+            combos.add(new String[]{rawStripped, rawArtist});
+            combos.add(new String[]{rawStripped, ca});
+            combos.add(new String[]{rawStripped, ""});
         }
 
-        // ④ 첫 세그먼트 (구분자 앞부분)
+        // ③ 정제 제목
+        if (!ct.equals(rawTitle)) {
+            combos.add(new String[]{ct, ca});
+            combos.add(new String[]{ct, rawArtist});
+            combos.add(new String[]{ct, ""});
+        }
+
+        // ④ 정제 제목 + 괄호 제거
+        if (!stripped.equals(ct) && !stripped.equals(rawStripped)) {
+            combos.add(new String[]{stripped, ca});
+            combos.add(new String[]{stripped, rawArtist});
+            combos.add(new String[]{stripped, ""});
+        }
+
+        // ⑤ 첫 세그먼트
         if (!firstSeg.equals(ct) && firstSeg.length() > 1) {
-            if (!ca.isEmpty())        set.add(firstSeg + " " + ca);
-            if (!rawArtist.isEmpty()) set.add(firstSeg + " " + rawArtist);
-            set.add(firstSeg);
+            combos.add(new String[]{firstSeg, ca});
+            combos.add(new String[]{firstSeg, rawArtist});
+            combos.add(new String[]{firstSeg, ""});
         }
 
-        // ⑤ feat 아티스트 조합
+        // ⑥ feat 아티스트 조합
         if (!feat.isEmpty()) {
-            set.add(ct + " " + feat);
-            if (!stripped.equals(ct)) set.add(stripped + " " + feat);
-            set.add(feat + " " + ct);
+            combos.add(new String[]{stripped, feat});
+            combos.add(new String[]{ct, feat});
         }
-
-        // ⑥ 아티스트 역순
-        if (!ca.isEmpty()) set.add(ca + " " + ct);
-        if (!ca.isEmpty() && !stripped.equals(ct)) set.add(ca + " " + stripped);
-
-        // ⑦ 특수문자 제거 정규화
-        String norm = ct.replaceAll("[^\\p{L}\\p{N}\\s]", " ").replaceAll("\\s{2,}", " ").trim();
-        if (!norm.isEmpty() && !norm.equals(ct)) {
-            if (!ca.isEmpty()) set.add(norm + " " + ca);
-            set.add(norm);
-        }
-
-        // ⑧ 단조로운 제목(2단어 이하) — 원본 아티스트 보완
-        if (ct.trim().split("\\s+").length <= 2 && !rawArtist.isEmpty())
-            set.add(ct + " " + rawArtist);
-
-        // ⑨ rawTitle의 괄호 제거 변형 (cleanTitle 없이)
-        String rawStripped = stripBrackets(rawTitle);
-        if (!rawStripped.equals(rawTitle) && !rawStripped.isEmpty()) {
-            if (!ca.isEmpty())        set.add(rawStripped + " " + ca);
-            if (!rawArtist.isEmpty()) set.add(rawStripped + " " + rawArtist);
-            set.add(rawStripped);
-        }
-
-        // ⑩ 첫 세그먼트의 괄호 제거 버전
-        String strippedFirstSeg = stripBrackets(firstSeg);
-        if (!strippedFirstSeg.equals(firstSeg) && !strippedFirstSeg.isEmpty()) {
-            if (!ca.isEmpty()) set.add(strippedFirstSeg + " " + ca);
-            set.add(strippedFirstSeg);
-        }
-
-        // ⑪ 첫 단어만 (짧은 제목 보완)
-        String fw = firstWord(ct);
-        if (!fw.isEmpty() && fw.length() > 1 && !fw.equals(ct)) {
-            if (!ca.isEmpty()) set.add(fw + " " + ca);
-        }
-
-        return new ArrayList<>(set);
-    }
-
-    // ════════════════════════════════════════════════════
-    //  Phase -1: 원본 무변형 lrclib /api/get 직접 조회
-    // ════════════════════════════════════════════════════
-    private JSONArray tryLrclibDirectRaw(String rawTitle, String rawArtist, double dur) {
-        if (rawTitle == null || rawTitle.isEmpty()) return null;
-
-        String[][] combos = {
-                { rawTitle, rawArtist          },
-                { rawTitle, cleanArtist(rawArtist) },
-                { rawTitle, ""                 },
-        };
 
         double    bestScore = Double.NEGATIVE_INFINITY;
         JSONArray bestLines = null;
@@ -591,7 +552,12 @@ public class MainActivity extends AppCompatActivity {
             String artistName = combo[1].trim();
             if (trackName.isEmpty()) continue;
 
+            // duration 있으면 포함해서, 없으면 제외해서 시도
             JSONObject item = lrclibGetDirect(trackName, artistName, dur);
+            if (item == null && dur > 0) {
+                // duration 없이 재시도
+                item = lrclibGetDirect(trackName, artistName, 0);
+            }
             if (item == null) continue;
 
             String lrcText = item.optString("syncedLyrics", "");
@@ -606,68 +572,8 @@ public class MainActivity extends AppCompatActivity {
                     item.optString("trackName", ""),
                     item.optString("artistName", ""),
                     candidateDur, dur, synced,
-                    cleanTitle(rawTitle), cleanArtist(rawArtist));
-
-            Log.d(TAG, "[lrclib-raw] track='" + trackName + "' score=" + score + " synced=" + synced);
-
-            if (score > bestScore) {
-                bestScore = score;
-                try { bestLines = parseLrc(lrcText); } catch (JSONException ignored) {}
-            }
-            if (score >= 60 && synced) break;
-        }
-
-        return (bestScore >= 20 && hasEnoughLines(bestLines)) ? bestLines : null;
-    }
-
-    // ════════════════════════════════════════════════════
-    //  Phase 0: 정제 제목 lrclib /api/get 직접 조회
-    // ════════════════════════════════════════════════════
-    private JSONArray tryLrclibDirect(
-            String ct, String ca, String stripped,
-            String rawTitle, String rawArtist, double dur) {
-
-        String[][] combos = {
-                { ct,                      ca           },
-                { stripped,                ca           },
-                { ct,                      rawArtist    },
-                { stripped,                rawArtist    },
-                { rawTitle,                ca           },
-                { rawTitle,                rawArtist    },
-                { firstWord(ct),           ca           },
-                { extractFirstSegment(ct), ca           },
-                { extractFirstSegment(ct), rawArtist    },
-                { stripBrackets(rawTitle), ca           },
-                { stripBrackets(rawTitle), rawArtist    },
-        };
-
-        double    bestScore = Double.NEGATIVE_INFINITY;
-        JSONArray bestLines = null;
-
-        for (String[] combo : combos) {
-            String trackName  = combo[0].trim();
-            String artistName = combo[1].trim();
-            if (trackName.isEmpty()) continue;
-            // Phase -1 에서 이미 시도한 원본 무변형 조합 스킵
-            if (trackName.equals(rawTitle) && artistName.equals(rawArtist)) continue;
-            if (trackName.equals(rawTitle) && artistName.equals(cleanArtist(rawArtist))) continue;
-            if (trackName.equals(rawTitle) && artistName.isEmpty()) continue;
-
-            JSONObject item = lrclibGetDirect(trackName, artistName, dur);
-            if (item == null) continue;
-
-            String lrcText = item.optString("syncedLyrics", "");
-            boolean synced = !lrcText.isEmpty();
-            if (!synced) lrcText = item.optString("plainLyrics", "");
-            if (lrcText == null || lrcText.isEmpty()) continue;
-
-            double candidateDur = getLrcLastTimestamp(lrcText);
-            if (candidateDur <= 0) candidateDur = item.optDouble("duration", 0);
-
-            double score = scoreLyricCandidate(
-                    item.optString("trackName", ""),
-                    item.optString("artistName", ""),
-                    candidateDur, dur, synced, ct, ca);
+                    ct.isEmpty() ? rawTitle : ct,
+                    ca.isEmpty() ? rawArtist : ca);
 
             Log.d(TAG, "[lrclib-direct] track='" + trackName + "' artist='" + artistName
                     + "' score=" + score + " synced=" + synced);
@@ -676,10 +582,13 @@ public class MainActivity extends AppCompatActivity {
                 bestScore = score;
                 try { bestLines = parseLrc(lrcText); } catch (JSONException ignored) {}
             }
-            if (score >= 65 && synced) break;
+            // 충분히 좋은 synced 결과면 조기 종료
+            if (score >= 60 && synced) break;
         }
 
-        return (bestScore >= 25 && hasEnoughLines(bestLines)) ? bestLines : null;
+        // 점수 임계치: duration 없으면 낮추기 (제목 매칭만으로도 통과)
+        double threshold = (dur > 0) ? 15 : 5;
+        return (bestScore >= threshold && hasEnoughLines(bestLines)) ? bestLines : null;
     }
 
     /** lrclib /api/get — 단일 항목 직접 조회 */
@@ -702,6 +611,81 @@ public class MainActivity extends AppCompatActivity {
                 return (parsed instanceof JSONObject) ? (JSONObject) parsed : null;
             }
         } catch (Exception e) { return null; }
+    }
+
+    // ════════════════════════════════════════════════════
+    //  쿼리 변형 목록 구성 (최대 20개)
+    // ════════════════════════════════════════════════════
+    private List<String> buildQueryVariants(
+            String rawTitle, String rawArtist,
+            String ct, String ca,
+            String stripped, String rawStripped,
+            String feat, String firstSeg) {
+
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+
+        // ① 원본 무변형 — 최우선
+        if (!rawArtist.isEmpty()) set.add(rawTitle + " " + rawArtist);
+        set.add(rawTitle);
+
+        // ② 원본 괄호 제거
+        if (!rawStripped.equals(rawTitle)) {
+            if (!rawArtist.isEmpty()) set.add(rawStripped + " " + rawArtist);
+            if (!ca.isEmpty())        set.add(rawStripped + " " + ca);
+            set.add(rawStripped);
+        }
+
+        // ③ 정제 제목 + 정제 아티스트
+        if (!ca.isEmpty()) set.add(ct + " " + ca);
+        set.add(ct);
+
+        // ④ 괄호 완전 제거
+        if (!stripped.equals(ct)) {
+            if (!ca.isEmpty())        set.add(stripped + " " + ca);
+            if (!rawArtist.isEmpty()) set.add(stripped + " " + rawArtist);
+            set.add(stripped);
+        }
+
+        // ⑤ 첫 세그먼트 (구분자 앞부분)
+        if (!firstSeg.equals(ct) && firstSeg.length() > 1) {
+            if (!ca.isEmpty())        set.add(firstSeg + " " + ca);
+            if (!rawArtist.isEmpty()) set.add(firstSeg + " " + rawArtist);
+            set.add(firstSeg);
+        }
+
+        // ⑥ feat 아티스트 조합
+        if (!feat.isEmpty()) {
+            set.add(stripped + " " + feat);
+            set.add(ct + " " + feat);
+            if (!ca.isEmpty()) set.add(feat + " " + ca);
+        }
+
+        // ⑦ 아티스트 역순
+        if (!ca.isEmpty()) {
+            set.add(ca + " " + ct);
+            if (!stripped.equals(ct)) set.add(ca + " " + stripped);
+        }
+
+        // ⑧ 특수문자 제거 정규화
+        String norm = ct.replaceAll("[^\\p{L}\\p{N}\\s]", " ").replaceAll("\\s{2,}", " ").trim();
+        if (!norm.isEmpty() && !norm.equals(ct)) {
+            if (!ca.isEmpty()) set.add(norm + " " + ca);
+            set.add(norm);
+        }
+
+        // ⑨ 첫 단어
+        String fw = firstWord(ct);
+        if (!fw.isEmpty() && fw.length() > 1 && !fw.equals(ct)) {
+            if (!ca.isEmpty()) set.add(fw + " " + ca);
+            set.add(fw);
+        }
+
+        // ⑩ 원본 첫 단어 + 원본 아티스트 (초단순)
+        String rawFw = firstWord(rawTitle);
+        if (!rawFw.isEmpty() && !rawFw.equals(fw) && !rawArtist.isEmpty())
+            set.add(rawFw + " " + rawArtist);
+
+        return new ArrayList<>(set);
     }
 
     // ════════════════════════════════════════════════════
@@ -732,7 +716,7 @@ public class MainActivity extends AppCompatActivity {
                             item.optString("trackName", ""),
                             item.optString("artistName", ""),
                             candidateDur, ytDur, synced, ct, ca);
-                    score -= qi * 1.0; // 뒤 쿼리일수록 소폭 패널티
+                    score -= qi * 0.5; // 뒤 쿼리일수록 소폭 패널티
 
                     Log.d(TAG, "[lrclib-search] q='" + q
                             + "' track='" + item.optString("trackName", "")
@@ -745,11 +729,12 @@ public class MainActivity extends AppCompatActivity {
                     }
                 } catch (JSONException ignored) {}
             }
-            // 충분히 좋은 synced 결과 확보 시 조기 종료
             if (bestScore >= 55 && bestSynced) break;
         }
 
-        if (bestLrc == null || bestScore < 10) return null;
+        // duration 없으면 임계치 낮춤
+        double threshold = (ytDur > 0) ? 8 : 0;
+        if (bestLrc == null || bestScore < threshold) return null;
         try { return parseLrc(bestLrc); } catch (JSONException e) { return null; }
     }
 
@@ -776,14 +761,14 @@ public class MainActivity extends AppCompatActivity {
         List<long[]> allIds    = new ArrayList<>();
         List<Double> allScores = new ArrayList<>();
 
-        for (int qi = 0; qi < variants.size(); qi++) {
+        for (int qi = 0; qi < Math.min(variants.size(), 12); qi++) {
             List<long[]> ids    = new ArrayList<>();
             List<Double> scores = new ArrayList<>();
             searchNetEase(variants.get(qi), ct, ca, ytDur, ids, scores);
 
             for (int i = 0; i < ids.size(); i++) {
                 long   sid   = ids.get(i)[0];
-                double score = scores.get(i) - qi * 1.0;
+                double score = scores.get(i) - qi * 0.5;
                 int existing = indexOfId(allIds, sid);
                 if (existing >= 0) {
                     if (score > allScores.get(existing)) allScores.set(existing, score);
@@ -804,7 +789,7 @@ public class MainActivity extends AppCompatActivity {
         Arrays.sort(idx, (a, b) -> Double.compare(fs.get(b), fs.get(a)));
 
         for (int i = 0; i < Math.min(10, idx.length); i++) {
-            if (fs.get(idx[i]) < 8) break;
+            if (fs.get(idx[i]) < 5) break;
             Log.d(TAG, "[NetEase] try songId=" + allIds.get(idx[i])[0] + " score=" + fs.get(idx[i]));
             JSONArray lines = fetchNetEaseLrc(allIds.get(idx[i])[0]);
             if (hasEnoughLines(lines)) return lines;
@@ -867,14 +852,77 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ════════════════════════════════════════════════════
+    //  Phase 3: lrclib 폴백 — duration 무시, 제목 유사도만
+    //  가사를 아직 못 찾았을 때 마지막 시도
+    // ════════════════════════════════════════════════════
+    private JSONArray tryLrclibFallback(
+            String ct, String ca, String stripped, String rawStripped,
+            String firstSeg, String rawTitle, String rawArtist) {
+
+        // 더 넓은 검색어로 시도
+        List<String> fallbackQueries = new ArrayList<>();
+        if (!ca.isEmpty()) fallbackQueries.add(ct + " " + ca);
+        fallbackQueries.add(ct);
+        if (!stripped.equals(ct)) fallbackQueries.add(stripped);
+        if (!rawStripped.equals(rawTitle)) fallbackQueries.add(rawStripped);
+        if (!firstSeg.equals(ct)) fallbackQueries.add(firstSeg);
+        if (!rawArtist.isEmpty()) fallbackQueries.add(rawTitle + " " + rawArtist);
+        // 제목의 처음 3단어
+        String[] words = ct.trim().split("\\s+");
+        if (words.length > 3) {
+            String short3 = words[0] + " " + words[1] + " " + words[2];
+            if (!ca.isEmpty()) fallbackQueries.add(short3 + " " + ca);
+            fallbackQueries.add(short3);
+        }
+
+        double   bestScore  = Double.NEGATIVE_INFINITY;
+        String   bestLrc    = null;
+
+        for (String q : fallbackQueries) {
+            JSONArray results = searchLrclib(q);
+            if (results == null || results.length() == 0) continue;
+
+            for (int i = 0; i < results.length(); i++) {
+                try {
+                    JSONObject item = results.getJSONObject(i);
+                    String lrcText = item.optString("syncedLyrics", "");
+                    boolean synced = !lrcText.isEmpty();
+                    if (!synced) lrcText = item.optString("plainLyrics", "");
+                    if (lrcText == null || lrcText.isEmpty()) continue;
+
+                    // duration 무시 — 제목/아티스트 유사도만
+                    double titleSim  = titleSim(ct.isEmpty() ? rawTitle : ct,
+                                                item.optString("trackName", ""));
+                    double artistSim = titleSim(ca.isEmpty() ? rawArtist : ca,
+                                                item.optString("artistName", ""));
+                    double score = titleSim * 50 + artistSim * 25 + (synced ? 15 : 0);
+
+                    Log.d(TAG, "[lrclib-fallback] q='" + q
+                            + "' track='" + item.optString("trackName","")
+                            + "' score=" + score);
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestLrc   = lrcText;
+                    }
+                } catch (JSONException ignored) {}
+            }
+            if (bestScore >= 35) break;
+        }
+
+        if (bestLrc == null || bestScore < 10) return null;
+        try { return parseLrc(bestLrc); } catch (JSONException e) { return null; }
+    }
+
+    // ════════════════════════════════════════════════════
     //  통합 채점 함수
     //
-    //  1. 길이 매칭      (최대 +60)
-    //  2. 제목 유사도    (최대 +35)
+    //  1. 길이 매칭      (최대 +60, duration 없으면 0)
+    //  2. 제목 유사도    (최대 +40)
     //  3. 아티스트 유사도(최대 +20)
     //  4. synced 보너스  (+15)
-    //  5. 제목 최저선 패널티 (-25)
-    //  6. 제목+아티스트 동시 일치 보너스 (+8)
+    //  5. 제목 최저선 패널티 (-20)
+    //  6. 제목+아티스트 동시 일치 보너스 (+10)
     // ════════════════════════════════════════════════════
     private double scoreLyricCandidate(
             String candidateTitle, String candidateArtist,
@@ -884,35 +932,37 @@ public class MainActivity extends AppCompatActivity {
 
         double score = 0;
 
-        // 1. 길이 매칭
+        // 1. 길이 매칭 (duration 없으면 스킵)
         if (ytDur > 0 && candidateDur > 0) {
             double diff = Math.abs(candidateDur - ytDur);
             if      (diff <= 1)  score += 60;
-            else if (diff <= 3)  score += 55;
-            else if (diff <= 5)  score += 45;
-            else if (diff <= 10) score += 32;
-            else if (diff <= 20) score += 16;
-            else if (diff <= 40) score +=  5;
-            else                 score -= 35;
+            else if (diff <= 3)  score += 52;
+            else if (diff <= 5)  score += 42;
+            else if (diff <= 10) score += 28;
+            else if (diff <= 20) score += 12;
+            else if (diff <= 40) score +=  3;
+            else                 score -= 30;
         }
 
         // 2. 제목 유사도
         double titleSim  = titleSim(refTitle, candidateTitle);
-        score += titleSim * 35;
+        score += titleSim * 40;
 
         // 3. 아티스트 유사도
-        double artistSim = titleSim(refArtist, candidateArtist);
+        double artistSim = 0;
+        if (!refArtist.isEmpty() && !candidateArtist.isEmpty())
+            artistSim = titleSim(refArtist, candidateArtist);
         score += artistSim * 20;
 
         // 4. synced 보너스
         if (isSynced) score += 15;
 
         // 5. 제목 최저선 패널티
-        if (!refTitle.isEmpty() && !candidateTitle.isEmpty() && titleSim < 0.15)
-            score -= 25;
+        if (!refTitle.isEmpty() && !candidateTitle.isEmpty() && titleSim < 0.12)
+            score -= 20;
 
-        // 6. 제목+아티스트 동시 일치 보너스
-        if (titleSim >= 0.6 && artistSim >= 0.5) score += 8;
+        // 6. 동시 일치 보너스
+        if (titleSim >= 0.55 && artistSim >= 0.45) score += 10;
 
         return score;
     }
@@ -1014,7 +1064,6 @@ public class MainActivity extends AppCompatActivity {
         return t;
     }
 
-    /** 제목의 첫 단어 (단조로운 제목 직접 조회용) */
     private String firstWord(String t) {
         if (t == null || t.isEmpty()) return "";
         String[] parts = t.trim().split("\\s+");
@@ -1056,16 +1105,11 @@ public class MainActivity extends AppCompatActivity {
             "|inst(?:rumental)?\\.?|acoustic(?:\\s+ver(?:sion)?)?\\.?" +
             "|mv\\s*ver(?:sion)?\\.?|single|title\\s*track)";
 
-        // 괄호 안 태그 제거
         t = t.replaceAll("(?i)\\(\\s*" + TAG_INNER + "[^)]*\\)", "").trim();
         t = t.replaceAll("(?i)\\[\\s*" + TAG_INNER + "[^\\]]*\\]", "").trim();
-        // 후미 태그 제거
         t = t.replaceAll("(?i)\\s*[-|]\\s*(?:" + TAG_INNER + ")\\s*$", "").trim();
-        // feat 제거
         t = t.replaceAll("(?i)\\s*\\(?\\s*(?:feat\\.?|ft\\.?|featuring)\\s+.+?(?:\\)|$)", "").trim();
-        // prod by 제거
         t = t.replaceAll("(?i)\\s*\\(?\\s*(?:prod(?:uced)?(?:\\.)?\\s*(?:by)?)\\s+[^)]+?(?:\\)|$)", "").trim();
-        // 특수 대시 통일
         t = t.replaceAll("[\\u2013\\u2014]+", "-").trim();
         return t.replaceAll("\\s{2,}", " ").trim();
     }
